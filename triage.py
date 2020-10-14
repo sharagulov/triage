@@ -11,9 +11,12 @@ import argparse
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -27,12 +30,9 @@ class Severity(str, Enum):
 
 @dataclass(frozen=True)
 class DetailLine:
-    """One metric row; ``metric_severity`` drives highlight when the value is abnormal."""
-
     label: str
     value: str
     metric_severity: Severity = Severity.OK
-    hint: str = ""
 
 
 @dataclass(frozen=True)
@@ -113,7 +113,9 @@ class Ansi:
     GREEN = "\033[32m"
     YELLOW = "\033[33m"
     CYAN = "\033[36m"
-    MAGENTA = "\033[35m"
+    HIDE_CURSOR = "\033[?25l"
+    SHOW_CURSOR = "\033[?25h"
+    CLEAR_SCREEN = "\033[2J\033[H"
 
 
 def colorize(text: str, code: str, enabled: bool) -> str:
@@ -144,18 +146,35 @@ def _metric_color(severity: Severity) -> str:
 def format_detail_line(line: DetailLine, use_color: bool) -> str:
     prefix = f"    • {line.label}: "
     if line.metric_severity == Severity.OK:
-        body = f"{line.value}"
-        if line.hint:
-            body = f"{body} ({line.hint})"
-        return colorize(f"{prefix}{body}", Ansi.DIM, use_color)
+        return colorize(f"{prefix}{line.value}", Ansi.DIM, use_color)
 
     value_text = colorize(line.value, _metric_color(line.metric_severity), use_color)
     tag = colorize(f" [{line.metric_severity.value}]", _metric_color(line.metric_severity), use_color)
-    hint = ""
-    if line.hint:
-        hint = colorize(f" — {line.hint}", Ansi.DIM, use_color)
     label_part = colorize(prefix, Ansi.BOLD, use_color) if use_color else prefix
-    return f"{label_part}{value_text}{tag}{hint}"
+    return f"{label_part}{value_text}{tag}"
+
+
+def _worst_severity(*levels: Severity) -> Severity:
+    order = {Severity.OK: 0, Severity.WARNING: 1, Severity.CRITICAL: 2}
+    return max(levels, key=lambda s: order[s])
+
+
+def terminal_live_on() -> None:
+    sys.stdout.write(Ansi.HIDE_CURSOR)
+    sys.stdout.flush()
+
+
+def terminal_live_off() -> None:
+    sys.stdout.write(Ansi.SHOW_CURSOR)
+    sys.stdout.flush()
+
+
+def draw_live_frame(text: str) -> None:
+    sys.stdout.write(Ansi.CLEAR_SCREEN)
+    sys.stdout.write(text)
+    if not text.endswith("\n"):
+        sys.stdout.write("\n")
+    sys.stdout.flush()
 
 
 def format_recommendation(index: int, text: str, use_color: bool) -> str:
@@ -373,36 +392,22 @@ def evaluate_cpu(load: LoadAvgSnapshot, cores: int) -> CheckResult:
     if load.runnable > cores * 4:
         runnable_sev = Severity.CRITICAL
 
+    per_core_sev = _worst_severity(sev_1, sev_5, sev_15)
     details = (
-        DetailLine("Logical CPUs", str(cores)),
+        DetailLine("CPUs", str(cores)),
         DetailLine(
-            "Load average (1m / 5m / 15m)",
+            "Load avg 1/5/15m",
             f"{load.load_1:.2f} / {load.load_5:.2f} / {load.load_15:.2f}",
-            hint="raw from /proc/loadavg",
         ),
         DetailLine(
-            "Per-core load 1m",
-            f"{per_core_1:.2f}",
-            metric_severity=sev_1,
-            hint="normal < 1.00; above 1.00 = threads waiting for CPU",
+            "Per-core 1/5/15m",
+            f"{per_core_1:.2f} / {per_core_5:.2f} / {per_core_15:.2f}",
+            metric_severity=per_core_sev,
         ),
         DetailLine(
-            "Per-core load 5m",
-            f"{per_core_5:.2f}",
-            metric_severity=sev_5,
-            hint="normal < 1.00",
-        ),
-        DetailLine(
-            "Per-core load 15m",
-            f"{per_core_15:.2f}",
-            metric_severity=sev_15,
-            hint="normal < 1.00",
-        ),
-        DetailLine(
-            "Runnable / total tasks",
+            "Runnable / tasks",
             f"{load.runnable} / {load.total_tasks}",
             metric_severity=runnable_sev,
-            hint="runnable = threads ready to run now",
         ),
     )
 
@@ -410,38 +415,28 @@ def evaluate_cpu(load: LoadAvgSnapshot, cores: int) -> CheckResult:
         return CheckResult(
             name="CPU Saturation",
             severity=Severity.CRITICAL,
-            summary=(
-                f"CPU run queue is overloaded: per-core 1m load is {per_core_1:.2f} "
-                f"on {cores} CPU(s) (need < 1.00)."
-            ),
+            summary=f"Per-core load 1m {per_core_1:.2f} (limit 1.0 on {cores} CPUs).",
             details=details,
             recommendations=(
-                f"Top CPU right now: run `ps -eo pid,comm,pcpu --sort=-pcpu | head -15` "
-                f"— kill or cgroup-limit the top offender if it is not expected.",
-                f"Per-CPU breakdown: `mpstat -P ALL 1 5` — if one CPU is 100% while others idle, "
-                f"check pinning/locks; if all high, you need more cores or less work.",
-                f"Load {load.load_1:.2f} with {cores} CPUs ⇒ {per_core_1:.2f} runnable threads per core; "
-                f"stop batch/cron jobs until 5m per-core load drops below 1.00 (now {per_core_5:.2f}).",
+                "`ps -eo pid,comm,pcpu --sort=-pcpu | head -15`",
+                "`mpstat -P ALL 1 5`",
             ),
         )
     if per_core_1 >= 1.0 or per_core_5 >= 0.85:
         return CheckResult(
             name="CPU Saturation",
             severity=Severity.WARNING,
-            summary=(
-                f"Per-core 1m load {per_core_1:.2f} is at or above 1.00 — CPU may be the bottleneck."
-            ),
+            summary=f"Per-core load 1m {per_core_1:.2f} — at or above 1.0.",
             details=details,
             recommendations=(
-                f"Snapshot consumers: `pidstat -u 1 5` — note PIDs with %CPU > 50.",
-                f"If 5m load keeps rising ({per_core_5:.2f} per core now), check disk stalls: "
-                f"`iostat -xz 1 3` — %util near 100% on a disk often inflates load.",
+                "`pidstat -u 1 5`",
+                "`iostat -xz 1 3`",
             ),
         )
     return CheckResult(
         name="CPU Saturation",
         severity=Severity.OK,
-        summary=f"Per-core 1m load {per_core_1:.2f} is below 1.00 — no run-queue saturation.",
+        summary=f"Per-core load 1m {per_core_1:.2f}.",
         details=details,
         recommendations=(),
     )
@@ -487,33 +482,24 @@ def evaluate_memory(mem: MemInfoSnapshot) -> CheckResult:
     details = (
         DetailLine("MemTotal", _kb_to_human(mem.mem_total_kb)),
         DetailLine(
-            "MemFree (unused physical)",
-            f"{_kb_to_human(mem.mem_free_kb)} ({free_pct:.1f}%)",
-            metric_severity=free_sev,
-            hint="low alone is OK if MemAvailable is high (cache)",
-        ),
-        DetailLine(
-            "Buffers + Cached (page cache)",
-            f"{_kb_to_human(mem.page_cache_kb)} ({cache_pct:.1f}%)",
-            hint="kernel can drop this under pressure",
-        ),
-        DetailLine(
             "MemAvailable",
             f"{_kb_to_human(mem.mem_available_kb)} ({avail_pct:.1f}%)",
             metric_severity=avail_sev,
-            hint="use this for OOM risk; alert if < 10%, critical if < 5%",
         ),
         DetailLine(
-            "Reclaimable above MemFree",
-            _kb_to_human(mem.reclaimable_pressure_kb),
-            hint="≈ cache+slab the kernel could free before failing allocations",
+            "MemFree",
+            f"{_kb_to_human(mem.mem_free_kb)} ({free_pct:.1f}%)",
+            metric_severity=free_sev,
         ),
         DetailLine(
-            "Swap used",
+            "Page cache",
+            f"{_kb_to_human(mem.page_cache_kb)} ({cache_pct:.1f}%)",
+        ),
+        DetailLine(
+            "Swap",
             f"{_kb_to_human(mem.swap_total_kb - mem.swap_free_kb)} / "
             f"{_kb_to_human(mem.swap_total_kb)} ({swap_used_pct:.1f}%)",
             metric_severity=swap_sev,
-            hint="heavy swap + low MemAvailable ⇒ slow host",
         ),
     )
 
@@ -525,51 +511,36 @@ def evaluate_memory(mem: MemInfoSnapshot) -> CheckResult:
         return CheckResult(
             name="Memory Pressure",
             severity=Severity.CRITICAL,
-            summary=(
-                f"MemAvailable is {avail_pct:.1f}% ({_kb_to_human(mem.mem_available_kb)}) — "
-                f"real RAM shortage, not just low MemFree ({free_pct:.1f}%)."
-            ),
+            summary=f"MemAvailable {avail_pct:.1f}% — critical.",
             details=details,
             recommendations=(
-                f"OOM history on this host: `sudo ./scripts/oom_investigator.sh -n 5` "
-                f"— if events exist, the killer already removed a process.",
-                f"Largest RAM users: `ps -eo pid,comm,rss --sort=-rss | head -20` "
-                f"(RSS column is KiB per process; focus on top 3 PIDs).",
-                f"You have {cache_pct:.1f}% in page cache but only {avail_pct:.1f}% MemAvailable — "
-                f"stop or restart the heaviest service above, or add RAM; "
-                f"swap is {swap_used_pct:.1f}% used.",
+                "`sudo ./scripts/oom_investigator.sh -n 5`",
+                "`ps -eo pid,comm,rss --sort=-rss | head -20`",
             ),
         )
     if low_available:
         return CheckResult(
             name="Memory Pressure",
             severity=Severity.WARNING,
-            summary=(
-                f"MemAvailable {avail_pct:.1f}% is below 10% — a traffic spike can trigger OOM soon."
-            ),
+            summary=f"MemAvailable {avail_pct:.1f}% — below 10%.",
             details=details,
             recommendations=(
-                f"Compare anon vs cache: `grep -E '^(AnonPages|Cached|Slab|SUnreclaim):' /proc/meminfo` "
-                f"— rising AnonPages/SUnreclaim with MemAvailable {avail_pct:.1f}% means app leak or growth.",
-                f"Watch live: `watch -n2 grep MemAvailable /proc/meminfo` — if it drops under 5%, "
-                f"run `ps -eo pid,comm,rss --sort=-rss | head -10` immediately.",
+                "`grep -E '^(AnonPages|Cached|Slab|SUnreclaim):' /proc/meminfo`",
+                "`ps -eo pid,comm,rss --sort=-rss | head -10`",
             ),
         )
     if mostly_cache:
         return CheckResult(
             name="Memory Pressure",
             severity=Severity.OK,
-            summary=(
-                f"MemAvailable {avail_pct:.1f}% is healthy; "
-                f"low MemFree ({free_pct:.1f}%) is mostly page cache ({cache_pct:.1f}%)."
-            ),
+            summary=f"MemAvailable {avail_pct:.1f}%; MemFree low ({free_pct:.1f}%) — mostly cache.",
             details=details,
             recommendations=(),
         )
     return CheckResult(
         name="Memory Pressure",
         severity=Severity.OK,
-        summary=f"MemAvailable {avail_pct:.1f}% — sufficient headroom.",
+        summary=f"MemAvailable {avail_pct:.1f}%.",
         details=details,
         recommendations=(),
     )
@@ -592,27 +563,20 @@ def evaluate_tcp(tcp: TcpSnapshot, cores: int) -> CheckResult:
         recv_sev = Severity.WARNING
 
     details = (
-        DetailLine("Data source", tcp.source),
-        DetailLine("ESTABLISHED sockets", str(tcp.established)),
         DetailLine(
-            "TIME-WAIT sockets",
-            str(tcp.time_wait),
+            "Sockets",
+            f"ESTAB {tcp.established}  TIME-WAIT {tcp.time_wait}  LISTEN {tcp.listen}",
             metric_severity=tw_sev,
-            hint=f"{time_wait_per_core:.1f} per CPU; high ⇒ many short TCP connections",
         ),
-        DetailLine("LISTEN sockets", str(tcp.listen)),
-        DetailLine("Other states", str(tcp.other)),
         DetailLine(
-            f"Sockets with Send-Q ≥ {q_human}",
+            f"Send-Q ≥ {q_human}",
             str(tcp.high_send_q),
             metric_severity=send_sev,
-            hint=">0 ⇒ peer not reading fast enough or app write backlog",
         ),
         DetailLine(
-            f"Sockets with Recv-Q ≥ {q_human}",
+            f"Recv-Q ≥ {q_human}",
             str(tcp.high_recv_q),
             metric_severity=recv_sev,
-            hint=">0 ⇒ app not reading from socket (slow handler)",
         ),
     )
 
@@ -625,61 +589,38 @@ def evaluate_tcp(tcp: TcpSnapshot, cores: int) -> CheckResult:
         return CheckResult(
             name="TCP / Network",
             severity=Severity.CRITICAL,
-            summary=(
-                f"{tcp.high_send_q} socket(s) with Send-Q ≥ {q_human}, "
-                f"{tcp.high_recv_q} with Recv-Q ≥ {q_human} — data stuck in kernel queues."
-            ),
+            summary=f"Queue backlog: Send-Q {tcp.high_send_q}, Recv-Q {tcp.high_recv_q}.",
             details=details,
             recommendations=(
-                f"List exact connections: `ss -tan state established "
-                f"'( recv-q >= {thresh} or send-q >= {thresh} )'` "
-                f"— note Local:Port and Peer:Port of each line.",
-                f"For high Recv-Q ({tcp.high_recv_q} sockets): on that port's service, "
-                f"check slow requests/logs; find PID via `ss -tanp` (needs root).",
-                f"For high Send-Q ({tcp.high_send_q} sockets): client or upstream is not ACKing; "
-                f"check retransmits: `ss -ti | grep -i retrans` on affected rows.",
+                f"`ss -tan state established '( recv-q >= {thresh} or send-q >= {thresh} )'`",
+                "`ss -tanp`",
             ),
         )
     if crit_time_wait:
         return CheckResult(
             name="TCP / Network",
             severity=Severity.CRITICAL,
-            summary=(
-                f"TIME-WAIT count {tcp.time_wait} ({time_wait_per_core:.0f}/CPU) — "
-                f"risk of ephemeral port exhaustion on busy outbound clients."
-            ),
+            summary=f"TIME-WAIT {tcp.time_wait} ({time_wait_per_core:.0f}/CPU).",
             details=details,
             recommendations=(
-                f"See who opens most connections: `ss -tan state time-wait | awk '{{print $4}}' "
-                f"| sort | uniq -c | sort -nr | head` — top local ports point to the service.",
-                f"Ephemeral range: `sysctl net.ipv4.ip_local_port_range` — with {tcp.time_wait} "
-                f"TIME-WAIT sockets, widen range or enable HTTP keep-alive / connection pooling.",
-                f"Fix at the client: reuse TCP connections instead of opening a new socket per request "
-                f"(pool size / keep-alive timeout).",
+                "`ss -tan state time-wait | awk '{print $4}' | sort | uniq -c | sort -nr | head`",
+                "`sysctl net.ipv4.ip_local_port_range`",
             ),
         )
     if warn_time_wait or tcp.high_recv_q > 0:
         return CheckResult(
             name="TCP / Network",
             severity=Severity.WARNING,
-            summary=(
-                f"TIME-WAIT={tcp.time_wait} or Recv-Q backlog ({tcp.high_recv_q} sockets "
-                f"≥ {q_human}) — watch latency."
-            ),
+            summary=f"TIME-WAIT {tcp.time_wait} or Recv-Q backlog {tcp.high_recv_q}.",
             details=details,
             recommendations=(
-                f"Non-zero queues: `ss -tan | awk 'NR==1 || $2>0 || $3>0'` "
-                f"— Recv-Q/Send-Q are bytes waiting in kernel.",
-                f"TIME-WAIT {tcp.time_wait}: if this spikes during deploys, enable keep-alive on "
-                f"load balancers/clients hitting this host.",
+                "`ss -tan | awk 'NR==1 || $2>0 || $3>0'`",
             ),
         )
     return CheckResult(
         name="TCP / Network",
         severity=Severity.OK,
-        summary=(
-            f"No queue backlogs; TIME-WAIT {tcp.time_wait} within normal range for {cores} CPU(s)."
-        ),
+        summary=f"TIME-WAIT {tcp.time_wait}, no queue backlog.",
         details=details,
         recommendations=(),
     )
@@ -694,11 +635,22 @@ def overall_severity(results: Sequence[CheckResult]) -> Severity:
     return worst
 
 
-def format_report(results: Iterable[CheckResult], host: str, use_color: bool) -> str:
+def format_report(
+    results: Iterable[CheckResult],
+    host: str,
+    use_color: bool,
+    *,
+    live: bool = False,
+    interval: float = 1.0,
+) -> str:
     lines: list[str] = []
-    title = colorize("server-triage-toolkit — USE snapshot", Ansi.CYAN + Ansi.BOLD, use_color)
+    title = colorize("server-triage-toolkit", Ansi.CYAN + Ansi.BOLD, use_color)
     lines.append(title)
-    lines.append(colorize(f"Host: {host}", Ansi.DIM, use_color))
+    meta = f"Host: {host}"
+    if live:
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        meta = f"{meta}  |  {ts}  |  refresh {interval:g}s  |  Ctrl+C exit"
+    lines.append(colorize(meta, Ansi.DIM, use_color))
     lines.append("")
 
     for result in results:
@@ -712,7 +664,6 @@ def format_report(results: Iterable[CheckResult], host: str, use_color: bool) ->
         for detail in result.details:
             lines.append(format_detail_line(detail, use_color))
         if result.recommendations:
-            lines.append(colorize("    What to do next:", Ansi.CYAN + Ansi.BOLD, use_color))
             for idx, rec in enumerate(result.recommendations, start=1):
                 lines.append(format_recommendation(idx, rec, use_color))
         lines.append("")
@@ -775,16 +726,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable ANSI colors (also respects NO_COLOR).",
     )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Single snapshot and exit (default when stdout is not a TTY).",
+    )
+    parser.add_argument(
+        "-i",
+        "--interval",
+        type=float,
+        default=1.0,
+        metavar="SEC",
+        help="Live refresh interval in seconds (default: 1).",
+    )
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    parser = build_arg_parser()
-    args = parser.parse_args(argv)
-
-    use_color = _supports_color() and not args.no_color
-    host = os.uname().nodename if hasattr(os, "uname") else "localhost"
-
+def _run_and_render(
+    args: argparse.Namespace,
+    host: str,
+    use_color: bool,
+    *,
+    live: bool,
+) -> tuple[int, int]:
+    """Returns (exit_code, signal_exit). signal_exit set when interrupted."""
     try:
         results, exit_code = run_triage(
             proc_root=args.proc_root,
@@ -793,13 +758,63 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     except FileNotFoundError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
-        return 3
+        return 3, 0
     except (OSError, ValueError) as exc:
         print(f"ERROR: failed to collect metrics: {exc}", file=sys.stderr)
-        return 3
+        return 3, 0
 
-    print(format_report(results, host=host, use_color=use_color))
-    return exit_code
+    report = format_report(
+        results,
+        host=host,
+        use_color=use_color,
+        live=live,
+        interval=args.interval,
+    )
+    if live:
+        draw_live_frame(report)
+    else:
+        print(report)
+    return exit_code, 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+
+    if args.interval <= 0:
+        print("ERROR: --interval must be > 0", file=sys.stderr)
+        return 2
+
+    use_color = _supports_color() and not args.no_color
+    host = os.uname().nodename if hasattr(os, "uname") else "localhost"
+    live = not args.once and sys.stdout.isatty()
+
+    if not live:
+        exit_code, _ = _run_and_render(args, host, use_color, live=False)
+        return exit_code
+
+    interrupted = {"flag": False}
+
+    def _handle_signal(signum: int, _frame: object) -> None:
+        interrupted["flag"] = True
+
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
+
+    terminal_live_on()
+    last_exit = 0
+    try:
+        while not interrupted["flag"]:
+            last_exit, _ = _run_and_render(args, host, use_color, live=True)
+            if interrupted["flag"]:
+                break
+            deadline = time.monotonic() + args.interval
+            while not interrupted["flag"] and time.monotonic() < deadline:
+                time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+    finally:
+        terminal_live_off()
+
+    return 130 if interrupted["flag"] else last_exit
 
 
 if __name__ == "__main__":

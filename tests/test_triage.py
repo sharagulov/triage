@@ -115,7 +115,6 @@ class ReportTests(unittest.TestCase):
             "MemAvailable",
             "3.2%",
             metric_severity=triage.Severity.CRITICAL,
-            hint="below 5%",
         )
         text = triage.format_detail_line(line, use_color=False)
         self.assertIn("[CRITICAL]", text)
